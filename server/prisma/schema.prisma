@@ -1,0 +1,52 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+// Looking for ways to speed up your queries, or scale easily with your serverless or edge functions?
+// Try Prisma Accelerate: https://pris.ly/cli/accelerate-init
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Chunk {
+   id String @id @default(uuid())
+   content String
+   filePath String
+   chunkType String?
+   metadata Json?
+   createdAt DateTime @default(now())
+   repo String
+   @@index([repo])
+   @@map("chunks")
+}
+
+model Convention {
+  id          String   @id @default(uuid())
+  repo        String
+  description String
+  sourcePr    Int?
+  createdAt   DateTime @default(now())
+
+  @@index([repo])
+  @@map("conventions")
+}
+
+model Review {
+  id         String   @id @default(uuid())
+  repo       String
+  prNumber   Int
+  headSha    String
+  issues     Json?
+  summary    String?
+  prOutcome  String?
+  postedAt   DateTime @default(now())
+
+  @@index([repo, prNumber])
+  @@map("reviews")
+}
