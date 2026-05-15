@@ -49,7 +49,7 @@ export async function processPRDiff(octokit: Octokit, owner: string, repo: strin
             continue;
         }
         
-        const functions = getEnclosingFunctions(content, filePath, changedLines);
+        const functions = await getEnclosingFunctions(content, filePath, changedLines);
         
         if (functions && functions.length > 0) {
             for (const func of functions) {

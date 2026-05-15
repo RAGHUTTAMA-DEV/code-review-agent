@@ -4,10 +4,20 @@ import {reviewQueue} from "../Queues/Producers/producer"
 export const webhoooksController = async (req:Request,res:Response)=>{
     
    try{
-  const {repo,prNumber,headSha,action} = req.body;
-    
+  const payload = req.body;
+  const action = payload.action;
+  // Support both GitHub's nested payload and flat test payloads
+  const repo = payload.repository?.full_name ?? payload.repo;
+  const prNumber = payload.number ?? payload.pull_request?.number ?? payload.prNumber;
+  const headSha = payload.pull_request?.head?.sha ?? payload.headSha;
+
+  if (!repo || !prNumber || !headSha) {
+    res.status(400).json({ message: "Missing required fields", repo, prNumber, headSha });
+    return;
+  }
+
     const queueJob = await reviewQueue.add("reviewJob",{
-        repo,prNumber,headSha,action 
+        repo, prNumber, headSha, action 
     })
 
     res.status(202).json({message:"Job Added",jobId:queueJob.id,repo,prNumber})   
