@@ -21,7 +21,7 @@ export const webhoooksController = async (req:Request,res:Response)=>{
   const headSha = payload.pull_request?.head?.sha ?? payload.headSha;
 
   if (!repo || !prNumber || !headSha) {
-    res.status(400).json({ message: "Missing required fdsields", repo, prNumber, headSha });
+    res.status(400).json({ message: "Missing required fields", repo, prNumber, headSha });
     return;
   }
 
