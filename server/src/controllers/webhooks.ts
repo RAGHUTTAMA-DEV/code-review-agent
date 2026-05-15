@@ -2,8 +2,17 @@
 import {Request,Response} from "express"
 import {reviewQueue} from "../Queues/Producers/producer"
 export const webhoooksController = async (req:Request,res:Response)=>{
-    
+     
    try{
+  const event = req.headers["x-github-event"] as string | undefined;
+
+  // Only process pull_request events; acknowledge everything else (push, ping, etc.)
+  if (event && event !== "pull_request") {
+    console.log(`Ignoring GitHub event: ${event}`);
+    res.status(200).json({ message: `Event '${event}' ignored` });
+    return;
+  }
+
   const payload = req.body;
   const action = payload.action;
   // Support both GitHub's nested payload and flat test payloads
