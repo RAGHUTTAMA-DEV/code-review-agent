@@ -23,7 +23,6 @@ export async function processPRDiff(octokit: Octokit, owner: string, repo: strin
         const filePath = file.to;
         if (!filePath) continue;
         
-        // Find changed line numbers and gather patches
         const changedLines: number[] = [];
         let patchSnippet = "";
         
@@ -40,7 +39,6 @@ export async function processPRDiff(octokit: Octokit, owner: string, repo: strin
         
         if (changedLines.length === 0) continue;
         
-        // Fetch full file content
         let content = "";
         try {
             content = await fetchFileContent(octokit, owner, repo, filePath, headSha);
@@ -63,7 +61,6 @@ export async function processPRDiff(octokit: Octokit, owner: string, repo: strin
                 });
             }
         } else {
-            // Fallback if no function matched or tree-sitter couldn't parse
             chunks.push({
                 file: filePath,
                 functionName: "unknown",

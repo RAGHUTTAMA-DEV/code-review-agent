@@ -1,15 +1,11 @@
 import path from "path";
 
-// web-tree-sitter is an ESM-first package; we require the CJS build directly
-// and use type annotations from the .d.cts to keep things working with commonjs.
-// eslint-disable-next-line @typescript-eslint/no-var-requires
 const TreeSitter = require("web-tree-sitter") as typeof import("web-tree-sitter");
 
 type Parser = InstanceType<typeof TreeSitter.Parser>;
 type Language = InstanceType<typeof TreeSitter.Language>;
 type SyntaxNode = ReturnType<Parser["parse"]> extends { rootNode: infer N } ? N : never;
 
-// ─── Singleton: lazily init parser + languages ────────────────────────────────
 let initPromise: Promise<void> | null = null;
 let tsLang: Language;
 let jsLang: Language;
@@ -19,7 +15,6 @@ async function ensureInit() {
     initPromise = (async () => {
         await TreeSitter.Parser.init();
 
-        // tree-sitter-wasms ships prebuilt .wasm grammars in its "out" folder
         const wasmsDir = path.dirname(require.resolve("tree-sitter-wasms/package.json"));
 
         tsLang = await TreeSitter.Language.load(

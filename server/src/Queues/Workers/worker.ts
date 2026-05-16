@@ -25,6 +25,7 @@ const reviewWorker = new Worker("reviewQueue",async (job)=>{
             prNumber:Number(prNumber),
             repo,
             headSha,
+            diffChunks,
         })
         console.log(`Review completed for PR #${prNumber}`);
         

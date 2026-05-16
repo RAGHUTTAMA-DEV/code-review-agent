@@ -1,11 +1,17 @@
 import axios from 'axios';
 import prisma from '../prismaClient';
+const MAX_EMBEDDING_INPUT_CHARS = 6000;
+
 export async function getQwenEmbedding(text: string): Promise<number[]> {
+  const truncated = text.length > MAX_EMBEDDING_INPUT_CHARS
+    ? text.slice(0, MAX_EMBEDDING_INPUT_CHARS)
+    : text;
+
   const response = await axios.post(
     'http://127.0.0.1:11434/api/embeddings',
     {
       model: 'qwen3-embedding:latest', 
-      prompt: text
+      prompt: truncated
     },
     {
       headers: {
@@ -20,8 +26,6 @@ export async function getQwenEmbedding(text: string): Promise<number[]> {
 export async function saveEmbeddings(content: string, fileId: string) {
   const codeChunks = await getQwenEmbedding(content);
 
-  // Note: Prisma requires $executeRaw for writing vectors.
-  // We stringify the array so Postgres can cast it to the vector type.
   await prisma.$executeRaw`
     INSERT INTO "Document" (id, content, embedding)
     VALUES (
@@ -33,7 +37,6 @@ export async function saveEmbeddings(content: string, fileId: string) {
 }
 
 export async function searchDocuments(queryChunks: number[], limit: number) {
-  // Prisma $queryRaw uses parameterized queries for safety.
   const results = await prisma.$queryRaw`
     SELECT id, content, embedding <=> ${JSON.stringify(queryChunks)}::vector AS distance
     FROM "Document"

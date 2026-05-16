@@ -5,6 +5,7 @@ import { getQwenEmbedding, searchDocuments } from "../embeddings";
 import prisma from "../../prismaClient";
 import { Octokit } from "@octokit/rest";
 import {Annotation} from "@langchain/langgraph"
+import { DiffChunk } from "../github/processPR";
 
 // ─── LangGraph State (Annotation, NOT Zod schema) ──────────────────────────
 const ReviewState = Annotation.Root({
@@ -21,13 +22,7 @@ const ReviewState = Annotation.Root({
 type ReviewStateType = typeof ReviewState.State;
 
 // ─── Domain types ───────────────────────────────────────────────────────────
-interface DiffChunk {
-    file: string;
-    patch: string;
-    fullFunction: string;   // fetched separately via contents API
-    functionName: string;
-    lineStart: number;
-}
+// DiffChunk is now imported from ../github/processPR
 
 interface ConventionRow {
     description: string;
@@ -49,10 +44,25 @@ const ReviewSchema = z.object({
 
 type ReviewOutput = z.infer<typeof ReviewSchema>;
 
+// ─── Constants ────────────────────────────────────────────────────────────────
+const MAX_CONTEXT_CHARS = 12000;   // max chars for the context window
+const MAX_FUNCTION_CHARS = 3000;   // max chars per full function body
+const MAX_PATCH_CHARS = 2000;      // max chars per diff patch
+const MAX_RETRIEVED_CHARS = 3000;  // max chars for retrieved similar code
+
+/**
+ * Truncates text to a max character count, appending a notice if truncated.
+ */
+function truncate(text: string, maxChars: number): string {
+    if (text.length <= maxChars) return text;
+    return text.slice(0, maxChars) + "\n... [truncated]";
+}
+
 // ─── LLM setup ───────────────────────────────────────────────────────────────
 const llm = new Ollama({
     model: "mistral",
     baseUrl: "http://127.0.0.1:11434",
+    numCtx: 16384,  // increase context window from default 4096
 });
 
 // ─── GitHub client ────────────────────────────────────────────────────────────
@@ -66,79 +76,6 @@ const octokit = new Octokit({ auth: process.env.GITHUB_TOKEN });
 function parseRepo(repoFullName: string) {
     const [owner, repo] = repoFullName.split("/");
     return { owner, repo };
-}
-
-/**
- * Parses a unified diff patch string and returns the changed line numbers.
- * e.g. "@@ -12,7 +12,10 @@" → lines 12–21 in the new file
- */
-function parseChangedLines(patch: string): number[] {
-    const lines: number[] = [];
-    let currentLine = 0;
-    for (const line of patch.split("\n")) {
-        const hunk = line.match(/^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/);
-        if (hunk) {
-            currentLine = parseInt(hunk[1], 10);
-            continue;
-        }
-        if (line.startsWith("-")) continue; // deleted line, no new-file number
-        if (line.startsWith("+") || !line.startsWith("\\")) {
-            lines.push(currentLine++);
-        }
-    }
-    return lines;
-}
-
-/**
- * Fetches the full file content at headSha and extracts the function that
- * contains the changed lines. Falls back to the raw patch if tree-sitter
- * isn't available yet.
- */
-async function fetchFullFunction(
-    owner: string,
-    repo: string,
-    filePath: string,
-    headSha: string,
-    changedLines: number[]
-): Promise<{ fullFunction: string; functionName: string; lineStart: number }> {
-    try {
-        const { data } = await octokit.repos.getContent({
-            owner,
-            repo,
-            path: filePath,
-            ref: headSha,
-        }) as { data: { content: string } };
-
-        const content = Buffer.from(data.content, "base64").toString("utf-8");
-        const allLines = content.split("\n");
-        const targetLine = changedLines[0] ?? 1;
-
-        // Simple heuristic: walk backwards from first changed line to find
-        // the function signature, walk forwards to find closing brace.
-        // Replace with tree-sitter for production accuracy.
-        let start = Math.max(0, targetLine - 1);
-        while (start > 0 && !/^\s*(async\s+)?function|^\s*(export\s+)?(async\s+)?(function|\w+\s*[=(])/.test(allLines[start])) {
-            start--;
-        }
-        let end = targetLine;
-        let depth = 0;
-        for (let i = start; i < allLines.length; i++) {
-            depth += (allLines[i].match(/{/g) || []).length;
-            depth -= (allLines[i].match(/}/g) || []).length;
-            if (depth <= 0 && i >= targetLine) { end = i; break; }
-        }
-
-        const slice = allLines.slice(start, end + 1).join("\n");
-        const nameMatch = slice.match(/function\s+(\w+)|(\w+)\s*[=(]/);
-        return {
-            fullFunction: slice,
-            functionName: nameMatch?.[1] ?? nameMatch?.[2] ?? "unknown",
-            lineStart: start + 1,
-        };
-    } catch {
-        // Fallback — just return the patch itself
-        return { fullFunction: "", functionName: "unknown", lineStart: changedLines[0] ?? 0 };
-    }
 }
 
 /**
@@ -185,80 +122,56 @@ function buildReviewPrompt(
         ? conventions.map(c => `- ${c.description}`).join("\n")
         : "No conventions recorded yet.";
 
+    // Build a list of all valid file paths for the LLM to reference
+    const validFiles = [...new Set(chunks.map(c => c.file))];
+    const validFilesBlock = validFiles.map(f => `- ${f}`).join("\n");
+
     const chunksBlock = chunks.map(c =>
-        `### ${c.file}${c.functionName !== "unknown" ? ` — ${c.functionName}` : ""}` +
-        (c.fullFunction ? `\nFull function:\n\`\`\`\n${c.fullFunction}\n\`\`\`` : "") +
-        `\nDiff:\n\`\`\`diff\n${c.patch}\n\`\`\``
+        `### ${c.file} (lines ${c.lineStart}–${c.lineEnd})${c.functionName !== "unknown" ? ` — function: ${c.functionName}` : ""}` +
+        (c.fullFunction ? `\nFull function context:\n\`\`\`\n${truncate(c.fullFunction, MAX_FUNCTION_CHARS)}\n\`\`\`` : "") +
+        `\nDiff patch:\n\`\`\`diff\n${truncate(c.patch, MAX_PATCH_CHARS)}\n\`\`\``
     ).join("\n\n");
 
     return `
-You are a senior code reviewer with deep knowledge of this specific repository.
+You are a senior code reviewer. You MUST only review the actual code shown below.
+
+CRITICAL RULES:
+1. ONLY reference files that appear in the "Changed code" section below. The ONLY valid files are:
+${validFilesBlock}
+2. ONLY reference line numbers that exist in the diff patches shown below.
+3. Do NOT invent or hallucinate filenames, line numbers, or issues.
+4. Do NOT generate generic advice. Every issue MUST point to a specific line in the actual diff.
+5. If the code looks fine and has no real issues, return an empty issues array — that is perfectly acceptable.
+6. Focus on bugs, security issues, and performance problems. Minor style nitpicks are NOT useful unless they clearly violate the repo's conventions listed below.
 
 ## Known conventions for this repo:
 ${conventionBlock}
 
 ## Relevant codebase context (similar existing code):
-${context || "No context retrieved."}
+${truncate(context, MAX_RETRIEVED_CHARS) || "No context retrieved."}
 
 ## Changed code to review:
 ${chunksBlock}
 
-Review the diff above. Be specific — reference actual patterns from the context.
-Your response must be a single JSON object matching this schema exactly (no extra text, no markdown fences):
+Respond with a SINGLE JSON object (no markdown fences, no extra text):
 {
   "issues": [
     {
       "type": "bug" | "style" | "security" | "performance",
       "severity": "critical" | "major" | "minor",
-      "file": "<filename>",
-      "line": <number>,
-      "message": "<what is wrong>",
-      "suggestion": "<how to fix it>"
+      "file": "<must be one of the files listed above>",
+      "line": <must be a line number from the diff above>,
+      "message": "<specific description of the problem>",
+      "suggestion": "<concrete fix with code if possible>"
     }
   ],
-  "summary": "<overall review summary>",
-  "conventions_learned": ["<new pattern observed>"]
+  "summary": "<brief summary of review findings>",
+  "conventions_learned": ["<new patterns observed in THIS code, if any>"]
 }
 `.trim();
 }
 
-// ─── Node 1: parseDiff ────────────────────────────────────────────────────────
-async function parseDiffNode(state: ReviewStateType) {
-    const { owner, repo } = parseRepo(state.repo);
-
-    // Fetch list of changed files for this PR
-    const { data: files } = await octokit.pulls.listFiles({
-        owner,
-        repo,
-        pull_number: state.prNumber,
-    });
-
-    const diffChunks: DiffChunk[] = [];
-
-    for (const file of files) {
-        // Skip binary files and deletions with no patch
-        if (!file.patch) continue;
-
-        const changedLines = parseChangedLines(file.patch);
-        const { fullFunction, functionName, lineStart } = await fetchFullFunction(
-            owner,
-            repo,
-            file.filename,
-            state.headSha,
-            changedLines
-        );
-
-        diffChunks.push({
-            file: file.filename,
-            patch: file.patch,
-            fullFunction,
-            functionName,
-            lineStart,
-        });
-    }
-
-    return { diffChunks };
-}
+// ─── Node 1 was parseDiff — REMOVED (chunks are now passed in from worker) ──
 
 // ─── Node 2: retrieveContext ──────────────────────────────────────────────────
 async function retrieveContextNode(state: ReviewStateType) {
@@ -290,15 +203,42 @@ async function retrieveContextNode(state: ReviewStateType) {
     };
 }
 
-// ─── Node 3: generateReview ───────────────────────────────────────────────────
+// ─── Node 2: generateReview ───────────────────────────────────────────────────
 async function generateReviewNode(state: ReviewStateType) {
+    // Short-circuit: if there are no diff chunks, skip the LLM call entirely
+    if (state.diffChunks.length === 0) {
+        console.log("No diff chunks to review — skipping LLM call.");
+        return {
+            reviewOutput: {
+                issues: [],
+                summary: "No reviewable code changes found in this PR.",
+                conventions_learned: [],
+            },
+        };
+    }
+
     const prompt = buildReviewPrompt(
         state.diffChunks,
         state.retrievedContext,
         state.conventions
     );
 
+    console.log("=== REVIEW PROMPT (first 500 chars) ===");
+    console.log(prompt.slice(0, 500));
+    console.log("========================================");
+
     const reviewOutput = await callLLMWithRetry(prompt);
+
+    // Post-process: filter out any hallucinated files the LLM might still sneak in
+    const validFiles = new Set(state.diffChunks.map(c => c.file));
+    reviewOutput.issues = reviewOutput.issues.filter(issue => {
+        if (!validFiles.has(issue.file)) {
+            console.warn(`Filtered out hallucinated file reference: ${issue.file}`);
+            return false;
+        }
+        return true;
+    });
+
     return { reviewOutput };
 }
 
@@ -379,13 +319,11 @@ async function updateMemoryNode(state: ReviewStateType) {
 
 // ─── Graph assembly ───────────────────────────────────────────────────────────
 const graph = new StateGraph(ReviewState)
-    .addNode("parseDiff", parseDiffNode)
     .addNode("retrieveContext", retrieveContextNode)
     .addNode("generateReview", generateReviewNode)
     .addNode("postComment", postCommentNode)
     .addNode("updateMemory", updateMemoryNode)
-    .addEdge(START, "parseDiff")
-    .addEdge("parseDiff", "retrieveContext")
+    .addEdge(START, "retrieveContext")
     .addEdge("retrieveContext", "generateReview")
     .addEdge("generateReview", "postComment")
     .addEdge("postComment", "updateMemory")
@@ -395,13 +333,17 @@ const graph = new StateGraph(ReviewState)
 // ─── Export: call this from your BullMQ worker ────────────────────────────────
 export async function runReviewAgent(params: {
     prNumber: number;
-    repo: string;   // "owner/reponame"
+    repo: string;       // "owner/reponame"
     headSha: string;
+    diffChunks: DiffChunk[];  // pre-parsed by processPRDiff
 }) {
+    console.log(`Running review agent with ${params.diffChunks.length} diff chunks`);
+
     const result = await graph.invoke({
         prNumber: params.prNumber,
         repo: params.repo,
         headSha: params.headSha,
+        diffChunks: params.diffChunks,
     });
 
     return result;
