@@ -52,7 +52,7 @@ type ReviewOutput = z.infer<typeof ReviewSchema>;
 // ─── LLM setup ───────────────────────────────────────────────────────────────
 const llm = new Ollama({
     model: "mistral",
-    baseUrl: "http://localhost:11434",
+    baseUrl: "http://127.0.0.1:11434",
 });
 
 // ─── GitHub client ────────────────────────────────────────────────────────────

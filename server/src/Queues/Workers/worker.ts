@@ -1,3 +1,6 @@
+import dotenv from "dotenv";
+dotenv.config();
+
 import { Worker } from "bullmq";
 import { Octokit } from "octokit";
 import { processPRDiff } from "../../services/github/processPR";

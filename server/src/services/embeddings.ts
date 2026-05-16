@@ -2,9 +2,9 @@ import axios from 'axios';
 import prisma from '../prismaClient';
 export async function getQwenEmbedding(text: string): Promise<number[]> {
   const response = await axios.post(
-    'http://localhost:11434/api/embeddings',
+    'http://127.0.0.1:11434/api/embeddings',
     {
-      model: 'qwen2.5:0.5b', 
+      model: 'qwen3-embedding:latest', 
       prompt: text
     },
     {
