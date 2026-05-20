@@ -204,6 +204,43 @@ async function retrieveContextNode(state: ReviewStateType) {
 }
 
 // ─── Node 2: generateReview ───────────────────────────────────────────────────
+
+/**
+ * Estimates how many characters a single chunk will consume in the prompt.
+ */
+function estimateChunkChars(chunk: DiffChunk): number {
+    const header = 80; // markdown header overhead
+    const funcBody = chunk.fullFunction
+        ? Math.min(chunk.fullFunction.length, MAX_FUNCTION_CHARS) + 40
+        : 0;
+    const patch = Math.min(chunk.patch.length, MAX_PATCH_CHARS) + 30;
+    return header + funcBody + patch;
+}
+
+/**
+ * Splits chunks into batches that each fit within a character budget.
+ * This ensures large PRs are reviewed in multiple LLM calls instead of
+ * overflowing the context window and missing issues.
+ */
+function batchChunks(chunks: DiffChunk[], maxCharsPerBatch: number): DiffChunk[][] {
+    const batches: DiffChunk[][] = [];
+    let currentBatch: DiffChunk[] = [];
+    let currentSize = 0;
+
+    for (const chunk of chunks) {
+        const size = estimateChunkChars(chunk);
+        if (currentBatch.length > 0 && currentSize + size > maxCharsPerBatch) {
+            batches.push(currentBatch);
+            currentBatch = [];
+            currentSize = 0;
+        }
+        currentBatch.push(chunk);
+        currentSize += size;
+    }
+    if (currentBatch.length > 0) batches.push(currentBatch);
+    return batches;
+}
+
 async function generateReviewNode(state: ReviewStateType) {
     // Short-circuit: if there are no diff chunks, skip the LLM call entirely
     if (state.diffChunks.length === 0) {
@@ -217,27 +254,60 @@ async function generateReviewNode(state: ReviewStateType) {
         };
     }
 
-    const prompt = buildReviewPrompt(
-        state.diffChunks,
-        state.retrievedContext,
-        state.conventions
-    );
+    // Split chunks into batches that fit the context window.
+    // Reserve ~4K for system prompt + retrieved context + output, leaving ~10K for code.
+    const MAX_CODE_CHARS_PER_BATCH = 10000;
+    const batches = batchChunks(state.diffChunks, MAX_CODE_CHARS_PER_BATCH);
 
-    console.log("=== REVIEW PROMPT (first 500 chars) ===");
-    console.log(prompt.slice(0, 500));
-    console.log("========================================");
+    console.log(`Reviewing ${state.diffChunks.length} chunks in ${batches.length} batch(es)`);
 
-    const reviewOutput = await callLLMWithRetry(prompt);
+    const allIssues: ReviewOutput["issues"] = [];
+    const allConventions: string[] = [];
+    const summaries: string[] = [];
 
-    // Post-process: filter out any hallucinated files the LLM might still sneak in
-    const validFiles = new Set(state.diffChunks.map(c => c.file));
-    reviewOutput.issues = reviewOutput.issues.filter(issue => {
-        if (!validFiles.has(issue.file)) {
-            console.warn(`Filtered out hallucinated file reference: ${issue.file}`);
-            return false;
+    for (let i = 0; i < batches.length; i++) {
+        const batch = batches[i];
+        console.log(`  Batch ${i + 1}/${batches.length}: ${batch.length} chunk(s) — files: ${[...new Set(batch.map(c => c.file))].join(", ")}`);
+
+        const prompt = buildReviewPrompt(
+            batch,
+            state.retrievedContext,
+            state.conventions
+        );
+
+        if (i === 0) {
+            console.log("=== REVIEW PROMPT (first 500 chars) ===");
+            console.log(prompt.slice(0, 500));
+            console.log("========================================");
         }
-        return true;
-    });
+
+        const batchResult = await callLLMWithRetry(prompt);
+
+        // Post-process: filter out any hallucinated files
+        const validFiles = new Set(batch.map(c => c.file));
+        const filteredIssues = batchResult.issues.filter(issue => {
+            if (!validFiles.has(issue.file)) {
+                console.warn(`Filtered out hallucinated file reference: ${issue.file}`);
+                return false;
+            }
+            return true;
+        });
+
+        allIssues.push(...filteredIssues);
+        allConventions.push(...batchResult.conventions_learned);
+        summaries.push(batchResult.summary);
+    }
+
+    // Merge results from all batches
+    const reviewOutput: ReviewOutput = {
+        issues: allIssues,
+        summary: batches.length === 1
+            ? summaries[0]
+            : `Reviewed ${state.diffChunks.length} code sections across ${batches.length} batches.\n\n${summaries.map((s, i) => `**Batch ${i + 1}:** ${s}`).join("\n")}`,
+        conventions_learned: [...new Set(allConventions)], // deduplicate
+    };
+
+    console.log(`Review complete: ${reviewOutput.issues.length} issue(s) found`);
 
     return { reviewOutput };
 }
